@@ -7,13 +7,14 @@ using Grasshopper.Kernel.Data;
 using Grasshopper.Kernel.Types;
 using Grasshopper.Kernel.Undo;
 using Grasshopper.Kernel.Undo.Actions;
+using Rhino;
 
 namespace AutoInternalise
 {
   public class AutoInternaliseInfo : GH_AssemblyInfo
   {
     public override string Name => "AutoInternalise";
-    public override string Description => "Internalises Rhino-referenced (and optionally wired) parameters in the document.";
+    public override string Description => "Internalizes Rhino-referenced (and optionally wired) parameters in the document.";
     public override Guid Id => new Guid("3c8b85a1-4660-4ed7-b408-9ac3d5225454");
     public override string AuthorName => "";
     public override string AuthorContact => "";
@@ -29,10 +30,13 @@ namespace AutoInternalise
     private bool _rhino;
     private bool _all;
     private bool _pending;
-    private int _referencedCount;
-    private int _wiredCount;
-    private int _failedCount;
     private GH_Document _hookedDoc;
+
+    // Rhino objects that could not be loaded; they are not retried until a toggle is switched on again,
+    // otherwise every solution would schedule another attempt.
+    private readonly HashSet<Guid> _failedIds = new HashSet<Guid>();
+    private readonly List<string> _internalized = new List<string>();
+    private readonly List<string> _failed = new List<string>();
 
     public AutoInternaliseComponent()
       : base("Auto Internalise", "AutoInt",
@@ -58,8 +62,12 @@ namespace AutoInternalise
 
     protected override void RegisterOutputParams(GH_OutputParamManager pManager)
     {
-      pManager.AddIntegerParameter("Referenced", "Ref", "Number of Rhino-referenced parameters internalised so far.", GH_ParamAccess.item);
-      pManager.AddIntegerParameter("Wired", "Wir", "Number of wired parameters internalised so far.", GH_ParamAccess.item);
+      pManager.AddTextParameter("Internalized", "I",
+        "What was internalized since a toggle was last switched on: parameter, Rhino object ID, type, name and layer.",
+        GH_ParamAccess.list);
+      pManager.AddTextParameter("Failed", "F",
+        "Rhino references that could not be loaded (object not in the open Rhino file), so they are still references.",
+        GH_ParamAccess.list);
     }
 
     public override void AddedToDocument(GH_Document document)
@@ -101,22 +109,29 @@ namespace AutoInternalise
       DA.GetData(0, ref rhino);
       DA.GetData(1, ref all);
 
-      DA.SetData(0, _referencedCount);
-      DA.SetData(1, _wiredCount);
-      if (_failedCount > 0)
-        AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
-          $"{_failedCount} referenced object(s) could not be loaded from Rhino and were left as references.");
-
-      _rhino = rhino;
-
+      bool rhinoRisingEdge = rhino && !_rhino;
       bool allRisingEdge = all && !_all;
+      _rhino = rhino;
       _all = all;
+
+      if (rhinoRisingEdge || allRisingEdge)
+      {
+        _failedIds.Clear();
+        _internalized.Clear();
+        _failed.Clear();
+      }
+
+      DA.SetDataList(0, _internalized);
+      DA.SetDataList(1, _failed);
+      if (_failed.Count > 0)
+        AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
+          $"{_failed.Count} Rhino reference(s) could not be loaded and were left as references. See the F output.");
 
       if (allRisingEdge)
         Schedule(OnPingDocument(), includeWired: true);
     }
 
-    // Catches references set after Run became true (e.g. "Set one curve").
+    // Catches references set after the toggle was switched on (e.g. "Set one curve").
     private void OnSolutionEnd(object sender, GH_SolutionEventArgs e)
     {
       if (!_rhino || _pending || Locked) return;
@@ -140,16 +155,13 @@ namespace AutoInternalise
 
     private void Internalise(GH_Document doc, bool includeWired)
     {
-      var undo = new GH_UndoRecord("Auto internalise");
-      _failedCount = 0;
+      var undo = new GH_UndoRecord("Auto internalize");
 
       foreach (var (param, itemType) in FindReferencedParams(doc))
       {
         undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
-        var args = new object[] { param, 0 };
-        InternaliseReferencesMethod.MakeGenericMethod(itemType).Invoke(null, args);
-        _failedCount += (int)args[1];
-        _referencedCount++;
+        InternaliseReferencesMethod.MakeGenericMethod(itemType)
+          .Invoke(null, new object[] { param, ParamLabel(param), _failedIds, _internalized, _failed });
       }
 
       if (includeWired)
@@ -161,8 +173,8 @@ namespace AutoInternalise
           if (itemType == null) continue;
 
           undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
-          InternaliseWiredMethod.MakeGenericMethod(itemType).Invoke(null, new object[] { param });
-          _wiredCount++;
+          InternaliseWiredMethod.MakeGenericMethod(itemType)
+            .Invoke(null, new object[] { param, ParamLabel(param), _failedIds, _internalized, _failed });
         }
       }
 
@@ -184,7 +196,7 @@ namespace AutoInternalise
       }
     }
 
-    /// <summary>Parameters whose internal (persistent) data contains geometry referenced from the Rhino document.</summary>
+    /// <summary>Parameters whose internal (persistent) data still contains loadable Rhino references.</summary>
     private List<(IGH_Param, Type)> FindReferencedParams(GH_Document doc)
     {
       var result = new List<(IGH_Param, Type)>();
@@ -198,7 +210,7 @@ namespace AutoInternalise
         var data = (IGH_Structure)param.GetType().GetProperty("PersistentData").GetValue(param);
         foreach (var goo in data.AllData(true))
         {
-          if (goo is IGH_GeometricGoo geo && geo.IsReferencedGeometry)
+          if (goo is IGH_GeometricGoo geo && geo.IsReferencedGeometry && !_failedIds.Contains(geo.ReferenceID))
           {
             result.Add((param, itemType));
             break;
@@ -206,6 +218,12 @@ namespace AutoInternalise
         }
       }
       return result;
+    }
+
+    private static string ParamLabel(IGH_Param param)
+    {
+      var top = param.Attributes?.GetTopLevel?.DocObject;
+      return top != null && !ReferenceEquals(top, param) ? $"{top.NickName}.{param.NickName}" : param.NickName;
     }
 
     private static IGH_DocumentObject TopLevel(IGH_Param param) =>
@@ -222,25 +240,56 @@ namespace AutoInternalise
       return null;
     }
 
-    private static void InternaliseReferencesTyped<T>(GH_PersistentParam<T> param, out int failed) where T : class, IGH_Goo
+    /// <summary>Describes a Rhino object as "id, type 'name' on layer".</summary>
+    private static string DescribeRhinoObject(Guid id, IGH_GeometricGoo geo)
     {
-      failed = 0;
+      var text = $"{id} {geo.TypeName}";
+      var rhinoDoc = RhinoDoc.ActiveDoc;
+      var obj = rhinoDoc?.Objects.FindId(id);
+      if (obj == null) return text + " (not in the open Rhino file)";
+
+      if (!string.IsNullOrEmpty(obj.Attributes.Name))
+        text += $" '{obj.Attributes.Name}'";
+      var layerIndex = obj.Attributes.LayerIndex;
+      if (layerIndex >= 0 && layerIndex < rhinoDoc.Layers.Count)
+        text += $" on layer '{rhinoDoc.Layers[layerIndex].FullPath}'";
+      return text;
+    }
+
+    /// <summary>Same as Grasshopper's own "Internalise data": load the geometry, then drop the Rhino object ID.</summary>
+    private static void DestroyReferences<T>(GH_PersistentParam<T> param, string label,
+      HashSet<Guid> failedIds, List<string> internalized, List<string> failed) where T : class, IGH_Goo
+    {
       foreach (var goo in param.PersistentData.AllData(true))
       {
         if (!(goo is IGH_GeometricGoo geo) || !geo.IsReferencedGeometry) continue;
 
-        // Make sure the geometry itself is in memory before dropping the link to the Rhino object.
-        if (!geo.IsGeometryLoaded && !geo.LoadGeometry())
+        var id = geo.ReferenceID;
+        if (failedIds.Contains(id)) continue;
+
+        var description = $"{label}: {DescribeRhinoObject(id, geo)}";
+        if (geo.IsGeometryLoaded || geo.LoadGeometry())
         {
-          failed++;
-          continue;
+          geo.ReferenceID = Guid.Empty;
+          internalized.Add(description);
         }
-        geo.ReferenceID = Guid.Empty;
+        else
+        {
+          failedIds.Add(id);
+          failed.Add(description);
+        }
       }
+    }
+
+    private static void InternaliseReferencesTyped<T>(GH_PersistentParam<T> param, string label,
+      HashSet<Guid> failedIds, List<string> internalized, List<string> failed) where T : class, IGH_Goo
+    {
+      DestroyReferences(param, label, failedIds, internalized, failed);
       param.ExpireSolution(false);
     }
 
-    private static void InternaliseWiredTyped<T>(GH_PersistentParam<T> param) where T : class, IGH_Goo
+    private static void InternaliseWiredTyped<T>(GH_PersistentParam<T> param, string label,
+      HashSet<Guid> failedIds, List<string> internalized, List<string> failed) where T : class, IGH_Goo
     {
       // Deep copy of the current (volatile) data.
       var data = new GH_Structure<T>((GH_Structure<T>)param.VolatileData, false);
@@ -249,7 +298,12 @@ namespace AutoInternalise
       for (int i = 0; i < data.PathCount; i++)
         param.PersistentData.AppendRange(data.Branches[i], data.Paths[i]);
 
+      int wires = param.SourceCount;
       param.RemoveAllSources();
+      internalized.Add($"{label}: {data.DataCount} item(s) from {wires} wire(s)");
+
+      // Data flowing in from a referencing parameter carries the Rhino IDs along; drop them too.
+      DestroyReferences(param, label, failedIds, internalized, failed);
       param.ExpireSolution(false);
     }
   }
