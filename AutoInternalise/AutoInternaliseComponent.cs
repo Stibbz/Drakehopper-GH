@@ -31,8 +31,8 @@ namespace AutoInternalise
 
     private bool _rhino;
     private bool _all;
+    private bool _revit;
     private bool _pendingRhino;
-    private bool _pendingAll;
     private GH_Document _hookedDoc;
 
     // Automatic Rhino internalization runs at most once per interval; switching the toggle on resets it.
@@ -72,6 +72,11 @@ namespace AutoInternalise
       pManager.AddBooleanParameter("Internalize All", "All",
         "When this becomes true, every parameter that supports it is internalized once: Rhino references as well as " +
         "parameters with incoming wires (the wires are removed).",
+        GH_ParamAccess.item, false);
+      pManager.AddBooleanParameter("Internalize Revit Elements", "Revit",
+        "When this becomes true, every Rhino.Inside.Revit element parameter with incoming wires (e.g. the Elements input " +
+        "of Element Geometry fed by a Graphical Element) is internalized once and its wires are removed. " +
+        "Note: this stores element references (UniqueIds); the Revit model must still be open to get their geometry.",
         GH_ParamAccess.item, false);
     }
 
@@ -122,16 +127,19 @@ namespace AutoInternalise
 
     protected override void SolveInstance(IGH_DataAccess DA)
     {
-      bool rhino = false, all = false;
+      bool rhino = false, all = false, revit = false;
       DA.GetData(0, ref rhino);
       DA.GetData(1, ref all);
+      DA.GetData(2, ref revit);
 
       bool rhinoRisingEdge = rhino && !_rhino;
       bool allRisingEdge = all && !_all;
+      bool revitRisingEdge = revit && !_revit;
       _rhino = rhino;
       _all = all;
+      _revit = revit;
 
-      if (rhinoRisingEdge || allRisingEdge)
+      if (rhinoRisingEdge || allRisingEdge || revitRisingEdge)
       {
         _failedIds.Clear();
         _internalized.Clear();
@@ -153,7 +161,9 @@ namespace AutoInternalise
           $"{_failed.Count} Rhino reference(s) could not be loaded and were left as references. See the F output.");
 
       if (allRisingEdge)
-        ScheduleAll(OnPingDocument());
+        ScheduleOnce(OnPingDocument(), rhinoReferences: true, wiredFilter: _ => true);
+      else if (revitRisingEdge)
+        ScheduleOnce(OnPingDocument(), rhinoReferences: false, wiredFilter: IsRevitElementType);
     }
 
     // Catches references set after the toggle was switched on (e.g. "Set one curve").
@@ -201,34 +211,35 @@ namespace AutoInternalise
         // The toggle may have been switched off, or the component removed, while waiting.
         if (!_rhino || !ReferenceEquals(d, _hookedDoc)) return;
 
-        Internalise(d, includeWired: false);
+        Internalise(d, rhinoReferences: true, wiredFilter: null);
         _lastRhinoRun = DateTime.Now;
         Message = null;
         ExpireSolution(false);
       });
     }
 
-    private void ScheduleAll(GH_Document doc)
+    /// <summary>One-off run, triggered when a toggle switches on.</summary>
+    private void ScheduleOnce(GH_Document doc, bool rhinoReferences, Func<Type, bool> wiredFilter)
     {
-      if (doc == null || _pendingAll) return;
-      _pendingAll = true;
+      if (doc == null) return;
       doc.ScheduleSolution(5, d =>
       {
-        _pendingAll = false;
         if (!ReferenceEquals(d, _hookedDoc)) return;
-
-        var changed = Internalise(d, includeWired: true);
-
-        // Selecting is only done for this one-off, user-triggered run; the timed Rhino run would steal the
-        // selection while you work.
-        if (changed.Count > 0)
-        {
-          d.DeselectAll();
-          foreach (var obj in changed)
-            obj.Attributes.Selected = true;
-        }
+        Internalise(d, rhinoReferences, wiredFilter);
         ExpireSolution(false);
       });
+    }
+
+    /// <summary>
+    /// True for Rhino.Inside.Revit element data types. Matched by name so this plugin also loads without Rhino.Inside.Revit.
+    /// </summary>
+    private static bool IsRevitElementType(Type itemType)
+    {
+      const string ElementInterface = "RhinoInside.Revit.GH.Types.IGH_Element";
+      if (itemType.FullName == ElementInterface) return true;
+      foreach (var i in itemType.GetInterfaces())
+        if (i.FullName == ElementInterface) return true;
+      return false;
     }
 
     private void HookCanvas()
@@ -271,12 +282,15 @@ namespace AutoInternalise
     }
 
     /// <summary>Internalizes and returns the top-level objects that actually changed.</summary>
-    private HashSet<IGH_DocumentObject> Internalise(GH_Document doc, bool includeWired)
+    /// <param name="rhinoReferences">Internalize geometry referenced from the Rhino file.</param>
+    /// <param name="wiredFilter">If not null, also internalize wired parameters whose data type passes this filter.</param>
+    private HashSet<IGH_DocumentObject> Internalise(GH_Document doc, bool rhinoReferences, Func<Type, bool> wiredFilter)
     {
       var undo = new GH_UndoRecord("Auto internalize");
       var changed = new HashSet<IGH_DocumentObject>();
 
-      foreach (var (param, itemType) in FindReferencedParams(doc))
+      var referenced = rhinoReferences ? FindReferencedParams(doc) : new List<(IGH_Param, Type)>();
+      foreach (var (param, itemType) in referenced)
       {
         undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
         int before = _internalized.Count;
@@ -285,13 +299,13 @@ namespace AutoInternalise
         if (_internalized.Count > before) changed.Add(TopLevel(param));
       }
 
-      if (includeWired)
+      if (wiredFilter != null)
       {
         foreach (var param in AllParams(doc))
         {
           if (param.SourceCount == 0) continue;
           var itemType = PersistentItemType(param.GetType());
-          if (itemType == null) continue;
+          if (itemType == null || !wiredFilter(itemType)) continue;
 
           undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
           InternaliseWiredMethod.MakeGenericMethod(itemType)
