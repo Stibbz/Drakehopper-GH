@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Reflection;
+using System.Drawing.Drawing2D;
+using Grasshopper.GUI.Canvas;
 using Grasshopper.Kernel;
 using Grasshopper.Kernel.Data;
 using Grasshopper.Kernel.Types;
@@ -36,7 +38,7 @@ namespace AutoInternalise
     // Automatic Rhino internalization runs at most once per interval; switching the toggle on resets it.
     // The wait uses its own timer because GH_Document.ScheduleSolution fires all callbacks at the earliest
     // scheduled time, so a long delay there would be cut short by any other scheduled solution.
-    private static readonly TimeSpan RhinoInterval = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan RhinoInterval = TimeSpan.FromMinutes(15);
     private DateTime _lastRhinoRun = DateTime.MinValue;
     private System.Windows.Forms.Timer _rhinoTimer;
 
@@ -45,6 +47,11 @@ namespace AutoInternalise
     private readonly HashSet<Guid> _failedIds = new HashSet<Guid>();
     private readonly List<string> _internalized = new List<string>();
     private readonly List<string> _failed = new List<string>();
+
+    // Top-level objects that had something internalized; outlined on the canvas until a toggle is switched on again.
+    private readonly HashSet<IGH_DocumentObject> _highlighted = new HashSet<IGH_DocumentObject>();
+    private static readonly Color HighlightColor = Color.FromArgb(255, 140, 0);
+    private GH_Canvas _paintCanvas;
 
     public AutoInternaliseComponent()
       : base("Auto Internalise", "AutoInt",
@@ -108,6 +115,7 @@ namespace AutoInternalise
     private void Unhook()
     {
       StopRhinoTimer();
+      UnhookCanvas();
       if (_hookedDoc != null) _hookedDoc.SolutionEnd -= OnSolutionEnd;
       _hookedDoc = null;
     }
@@ -128,6 +136,8 @@ namespace AutoInternalise
         _failedIds.Clear();
         _internalized.Clear();
         _failed.Clear();
+        _highlighted.Clear();
+        Grasshopper.Instances.InvalidateCanvas();
       }
       if (rhinoRisingEdge)
         _lastRhinoRun = DateTime.MinValue;
@@ -207,20 +217,72 @@ namespace AutoInternalise
         _pendingAll = false;
         if (!ReferenceEquals(d, _hookedDoc)) return;
 
-        Internalise(d, includeWired: true);
+        var changed = Internalise(d, includeWired: true);
+
+        // Selecting is only done for this one-off, user-triggered run; the timed Rhino run would steal the
+        // selection while you work.
+        if (changed.Count > 0)
+        {
+          d.DeselectAll();
+          foreach (var obj in changed)
+            obj.Attributes.Selected = true;
+        }
         ExpireSolution(false);
       });
     }
 
-    private void Internalise(GH_Document doc, bool includeWired)
+    private void HookCanvas()
+    {
+      var canvas = Grasshopper.Instances.ActiveCanvas;
+      if (canvas == null || ReferenceEquals(canvas, _paintCanvas)) return;
+      UnhookCanvas();
+      _paintCanvas = canvas;
+      canvas.CanvasPostPaintObjects += OnCanvasPostPaintObjects;
+    }
+
+    private void UnhookCanvas()
+    {
+      if (_paintCanvas != null) _paintCanvas.CanvasPostPaintObjects -= OnCanvasPostPaintObjects;
+      _paintCanvas = null;
+    }
+
+    private void OnCanvasPostPaintObjects(GH_Canvas sender)
+    {
+      if (_highlighted.Count == 0 || sender.Document == null || !ReferenceEquals(sender.Document, _hookedDoc)) return;
+
+      var g = sender.Graphics;
+      using (var pen = new Pen(HighlightColor, 3f))
+      using (var fill = new SolidBrush(Color.FromArgb(40, HighlightColor)))
+      {
+        foreach (var obj in _highlighted)
+        {
+          // Skip objects that were deleted since.
+          if (obj.Attributes == null || !ReferenceEquals(obj.OnPingDocument(), _hookedDoc)) continue;
+
+          var bounds = obj.Attributes.Bounds;
+          bounds.Inflate(6f, 6f);
+          using (GraphicsPath path = GH_CapsuleRenderEngine.CreateRoundedRectangle(bounds, 6f))
+          {
+            g.FillPath(fill, path);
+            g.DrawPath(pen, path);
+          }
+        }
+      }
+    }
+
+    /// <summary>Internalizes and returns the top-level objects that actually changed.</summary>
+    private HashSet<IGH_DocumentObject> Internalise(GH_Document doc, bool includeWired)
     {
       var undo = new GH_UndoRecord("Auto internalize");
+      var changed = new HashSet<IGH_DocumentObject>();
 
       foreach (var (param, itemType) in FindReferencedParams(doc))
       {
         undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
+        int before = _internalized.Count;
         InternaliseReferencesMethod.MakeGenericMethod(itemType)
           .Invoke(null, new object[] { param, ParamLabel(param), _failedIds, _internalized, _failed });
+        if (_internalized.Count > before) changed.Add(TopLevel(param));
       }
 
       if (includeWired)
@@ -234,11 +296,20 @@ namespace AutoInternalise
           undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
           InternaliseWiredMethod.MakeGenericMethod(itemType)
             .Invoke(null, new object[] { param, ParamLabel(param), _failedIds, _internalized, _failed });
+          changed.Add(TopLevel(param));
         }
       }
 
       if (undo.ActionCount > 0)
         doc.UndoUtil.RecordEvent(undo);
+
+      if (changed.Count > 0)
+      {
+        _highlighted.UnionWith(changed);
+        HookCanvas();
+        Grasshopper.Instances.InvalidateCanvas();
+      }
+      return changed;
     }
 
     private IEnumerable<IGH_Param> AllParams(GH_Document doc)
