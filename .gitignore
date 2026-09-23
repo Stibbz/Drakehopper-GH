@@ -1,0 +1,22 @@
+# Build output
+bin/
+obj/
+*.gha
+*.pdb
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+*.userprefs
+
+# NuGet
+packages/
+*.nupkg
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
