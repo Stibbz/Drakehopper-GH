@@ -75,17 +75,17 @@ namespace AutoInternalise
 
     protected override void RegisterInputParams(GH_InputParamManager pManager)
     {
-      pManager.AddBooleanParameter("Auto Rhino (every 15 min)", "Rhino 15m",
+      pManager.AddBooleanParameter("Rhino", "Rhino",
         "CONTINUOUS. While true, geometry referenced from the Rhino file is internalized automatically, " +
         "at most once every 15 minutes (cooldown shared with Revit). Switching it on runs immediately.",
         GH_ParamAccess.item, false);
-      pManager.AddBooleanParameter("Auto Revit (every 15 min)", "Revit 15m",
+      pManager.AddBooleanParameter("Revit", "Revit",
         "CONTINUOUS. While true, every Rhino.Inside.Revit element parameter with incoming wires (e.g. the Elements input " +
         "of Element Geometry fed by a Graphical Element) is internalized and its wires removed, at most once every " +
         "15 minutes (cooldown shared with Rhino). Switching it on runs immediately. " +
         "Note: this stores element references (UniqueIds); the Revit model must still be open to get their geometry.",
         GH_ParamAccess.item, false);
-      pManager.AddBooleanParameter("Internalize All (once)", "All once",
+      pManager.AddBooleanParameter("All (once)", "All (once)",
         "ONE-OFF. When this switches to true, every parameter that supports it is internalized once: Rhino references " +
         "as well as parameters with incoming wires (the wires are removed).",
         GH_ParamAccess.item, false);
