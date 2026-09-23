@@ -29,8 +29,16 @@ namespace AutoInternalise
 
     private bool _rhino;
     private bool _all;
-    private bool _pending;
+    private bool _pendingRhino;
+    private bool _pendingAll;
     private GH_Document _hookedDoc;
+
+    // Automatic Rhino internalization runs at most once per interval; switching the toggle on resets it.
+    // The wait uses its own timer because GH_Document.ScheduleSolution fires all callbacks at the earliest
+    // scheduled time, so a long delay there would be cut short by any other scheduled solution.
+    private static readonly TimeSpan RhinoInterval = TimeSpan.FromMinutes(5);
+    private DateTime _lastRhinoRun = DateTime.MinValue;
+    private System.Windows.Forms.Timer _rhinoTimer;
 
     // Rhino objects that could not be loaded; they are not retried until a toggle is switched on again,
     // otherwise every solution would schedule another attempt.
@@ -99,6 +107,7 @@ namespace AutoInternalise
 
     private void Unhook()
     {
+      StopRhinoTimer();
       if (_hookedDoc != null) _hookedDoc.SolutionEnd -= OnSolutionEnd;
       _hookedDoc = null;
     }
@@ -120,6 +129,12 @@ namespace AutoInternalise
         _internalized.Clear();
         _failed.Clear();
       }
+      if (rhinoRisingEdge)
+        _lastRhinoRun = DateTime.MinValue;
+      if (rhinoRisingEdge || !rhino)
+        StopRhinoTimer();
+      if (!rhino)
+        Message = null;
 
       DA.SetDataList(0, _internalized);
       DA.SetDataList(1, _failed);
@@ -128,27 +143,71 @@ namespace AutoInternalise
           $"{_failed.Count} Rhino reference(s) could not be loaded and were left as references. See the F output.");
 
       if (allRisingEdge)
-        Schedule(OnPingDocument(), includeWired: true);
+        ScheduleAll(OnPingDocument());
     }
 
     // Catches references set after the toggle was switched on (e.g. "Set one curve").
     private void OnSolutionEnd(object sender, GH_SolutionEventArgs e)
     {
-      if (!_rhino || _pending || Locked) return;
-      if (e.Document != null && FindReferencedParams(e.Document).Count > 0)
-        Schedule(e.Document, includeWired: false);
+      if (!_rhino || _pendingRhino || Locked || (_rhinoTimer?.Enabled ?? false)) return;
+      if (e.Document == null || FindReferencedParams(e.Document).Count == 0) return;
+
+      var wait = _lastRhinoRun + RhinoInterval - DateTime.Now;
+      if (wait <= TimeSpan.Zero)
+      {
+        ScheduleRhino(e.Document);
+        return;
+      }
+
+      if (_rhinoTimer == null)
+      {
+        _rhinoTimer = new System.Windows.Forms.Timer();
+        _rhinoTimer.Tick += (s, a) =>
+        {
+          StopRhinoTimer();
+          if (_rhino && _hookedDoc != null) ScheduleRhino(_hookedDoc);
+        };
+      }
+      _rhinoTimer.Interval = Math.Max(1, (int)Math.Ceiling(wait.TotalMilliseconds));
+      _rhinoTimer.Start();
+
+      Message = $"Next: {DateTime.Now + wait:HH:mm:ss}";
+      Grasshopper.Instances.InvalidateCanvas();
     }
 
-    private void Schedule(GH_Document doc, bool includeWired)
+    private void StopRhinoTimer()
     {
-      if (doc == null || _pending) return;
+      _rhinoTimer?.Stop();
+    }
 
-      // The document must not be modified during a solution, so defer the work.
-      _pending = true;
+    // The document must not be modified during a solution, so the work is deferred to a scheduled solution.
+    private void ScheduleRhino(GH_Document doc)
+    {
+      if (doc == null || _pendingRhino) return;
+      _pendingRhino = true;
       doc.ScheduleSolution(5, d =>
       {
-        _pending = false;
-        Internalise(d, includeWired);
+        _pendingRhino = false;
+        // The toggle may have been switched off, or the component removed, while waiting.
+        if (!_rhino || !ReferenceEquals(d, _hookedDoc)) return;
+
+        Internalise(d, includeWired: false);
+        _lastRhinoRun = DateTime.Now;
+        Message = null;
+        ExpireSolution(false);
+      });
+    }
+
+    private void ScheduleAll(GH_Document doc)
+    {
+      if (doc == null || _pendingAll) return;
+      _pendingAll = true;
+      doc.ScheduleSolution(5, d =>
+      {
+        _pendingAll = false;
+        if (!ReferenceEquals(d, _hookedDoc)) return;
+
+        Internalise(d, includeWired: true);
         ExpireSolution(false);
       });
     }
