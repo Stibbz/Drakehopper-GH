@@ -42,6 +42,9 @@ namespace AutoInternalise
 
     private bool _pendingAuto;
     private bool _pendingRefresh;
+    private bool _pendingSave;
+    private bool _ownSave;
+    private bool _seenSolution;
     private DateTime _lastAutoRun = DateTime.MinValue;
     private DateTime _nextAutoRun;
     private System.Windows.Forms.Timer _autoTimer;
@@ -53,6 +56,8 @@ namespace AutoInternalise
     private readonly List<string> _details = new List<string>();
     private readonly List<string> _failed = new List<string>();
     private readonly HashSet<IGH_DocumentObject> _highlighted = new HashSet<IGH_DocumentObject>();
+    // Parameters downstream of Revit that can't be made standalone (they carry Revit elements); not retried.
+    private readonly HashSet<IGH_Param> _revitSkipped = new HashSet<IGH_Param>();
 
     // Everything internalized in the file, however it got there.
     private List<string> _fileInternalized = new List<string>();
@@ -64,8 +69,9 @@ namespace AutoInternalise
 
     public AutoInternaliseComponent()
       : base("Auto Internalise", "AutoInt",
-             "Rhino and Revit: while true, internalizes automatically, at most once every 15 minutes (shared). " +
-             "All: internalizes everything once when switched on. Internalized nodes are outlined in orange.",
+             "Rhino and Revit: while true, internalizes automatically, at most once every 15 minutes (shared), " +
+             "and always when the file is saved. All: internalizes everything once when switched on. " +
+             "Internalized nodes are outlined in orange.",
              "Params", "Util")
     { }
 
@@ -77,13 +83,14 @@ namespace AutoInternalise
     {
       pManager.AddBooleanParameter("Rhino", "Rhino",
         "CONTINUOUS. While true, geometry referenced from the Rhino file is internalized automatically, " +
-        "at most once every 15 minutes (cooldown shared with Revit). Switching it on runs immediately.",
+        "at most once every 15 minutes (cooldown shared with Revit), and when the file is saved. " +
+        "Switching it on runs immediately.",
         GH_ParamAccess.item, false);
       pManager.AddBooleanParameter("Revit", "Revit",
-        "CONTINUOUS. While true, every Rhino.Inside.Revit element parameter with incoming wires (e.g. the Elements input " +
-        "of Element Geometry fed by a Graphical Element) is internalized and its wires removed, at most once every " +
-        "15 minutes (cooldown shared with Rhino). Switching it on runs immediately. " +
-        "Note: this stores element references (UniqueIds); the Revit model must still be open to get their geometry.",
+        "CONTINUOUS. While true, the data coming out of Rhino.Inside.Revit components (e.g. the Geometry output of " +
+        "Element Geometry) is internalized into the first regular Grasshopper parameter it flows into, and that wire is " +
+        "removed. Everything downstream then runs without Revit. At most once every 15 minutes (cooldown shared with " +
+        "Rhino), and when the file is saved. Switching it on runs immediately.",
         GH_ParamAccess.item, false);
       pManager.AddBooleanParameter("All (once)", "All (once)",
         "ONE-OFF. When this switches to true, every parameter that supports it is internalized once: Rhino references " +
@@ -101,7 +108,8 @@ namespace AutoInternalise
       pManager.AddTextParameter("Details", "D",
         "Per item: node, Rhino object ID, type, name and layer, or the number of items taken from wires.", GH_ParamAccess.list);
       pManager.AddTextParameter("Failed", "F",
-        "Rhino references that could not be loaded (object not in the open Rhino file), so they are still references.",
+        "What could not be internalized and why: Rhino references whose object isn't in the open Rhino file, " +
+        "or Revit data that isn't available or can't exist without Revit.",
         GH_ParamAccess.list);
     }
 
@@ -129,15 +137,78 @@ namespace AutoInternalise
       if (ReferenceEquals(_hookedDoc, doc)) return;
       Unhook();
       _hookedDoc = doc;
+      _seenSolution = false;
       doc.SolutionEnd += OnSolutionEnd;
+      doc.ModifiedChanged += OnModifiedChanged;
     }
 
     private void Unhook()
     {
       StopAutoTimer();
       UnhookCanvas();
-      if (_hookedDoc != null) _hookedDoc.SolutionEnd -= OnSolutionEnd;
+      if (_hookedDoc != null)
+      {
+        _hookedDoc.SolutionEnd -= OnSolutionEnd;
+        _hookedDoc.ModifiedChanged -= OnModifiedChanged;
+      }
       _hookedDoc = null;
+    }
+
+    /// <summary>
+    /// Internalize on save. Grasshopper has no "before save" event, so this reacts to a save having happened
+    /// (document flips to unmodified and the file was just written), internalizes what the enabled modes cover,
+    /// ignoring the cooldown, and saves the file again so the file on disk is standalone.
+    /// </summary>
+    private void OnModifiedChanged(object sender, GH_DocModifiedEventArgs e)
+    {
+      var doc = e.Document;
+      if (doc == null || doc.IsModified || _ownSave || _pendingSave || !_seenSolution || Locked) return;
+      if (!(_rhino || _revit) || !doc.IsFilePathDefined) return;
+
+      // Only real saves: opening a file or undoing back to the saved state doesn't write the file.
+      try
+      {
+        if (DateTime.Now - System.IO.File.GetLastWriteTime(doc.FilePath) > TimeSpan.FromSeconds(10)) return;
+      }
+      catch
+      {
+        return;
+      }
+
+      if (!HasAutoWork(doc)) return;
+
+      _pendingSave = true;
+      doc.ScheduleSolution(5, d =>
+      {
+        _pendingSave = false;
+        if (!(_rhino || _revit) || !ReferenceEquals(d, _hookedDoc)) return;
+
+        StopAutoTimer();
+        int changed = Internalise(d, rhinoReferences: _rhino, revitBoundary: _revit, wiredAll: false);
+        _lastAutoRun = DateTime.Now;
+        if (changed == 0)
+        {
+          UpdateMessage();
+          ExpireSolution(false);
+          return;
+        }
+
+        _ownSave = true;
+        try
+        {
+          if (new GH_DocumentIO(d).SaveQuiet(d.FilePath))
+            d.IsModified = false;
+          else
+            AddRuntimeMessage(GH_RuntimeMessageLevel.Error, "Internalized on save, but saving the file again failed. Save manually.");
+        }
+        finally
+        {
+          _ownSave = false;
+        }
+
+        UpdateMessage("saved");
+        ExpireSolution(false);
+      });
     }
 
     protected override void SolveInstance(IGH_DataAccess DA)
@@ -161,6 +232,7 @@ namespace AutoInternalise
         _details.Clear();
         _failed.Clear();
         _highlighted.Clear();
+        _revitSkipped.Clear();
         Grasshopper.Instances.InvalidateCanvas();
       }
 
@@ -184,7 +256,7 @@ namespace AutoInternalise
       DA.SetDataList(3, _failed);
       if (_failed.Count > 0)
         AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
-          $"{_failed.Count} Rhino reference(s) could not be loaded and were left as references. See the F output.");
+          $"{_failed.Count} item(s) could not be internalized. See the F output.");
 
       if (allRisingEdge)
         ScheduleOnce(doc);
@@ -195,6 +267,7 @@ namespace AutoInternalise
       var doc = e.Document;
       if (doc == null || Locked) return;
 
+      _seenSolution = true;
       RefreshFileOutput(doc);
 
       if (!(_rhino || _revit) || _pendingAuto || (_autoTimer?.Enabled ?? false)) return;
@@ -240,14 +313,14 @@ namespace AutoInternalise
 
     private bool HasAutoWork(GH_Document doc) =>
       (_rhino && FindReferencedParams(doc).Count > 0) ||
-      (_revit && FindWiredParams(doc, IsRevitElementType).Any());
+      (_revit && FindRevitBoundaryParams(doc).Any());
 
     private void StopAutoTimer()
     {
       _autoTimer?.Stop();
     }
 
-    private void UpdateMessage()
+    private void UpdateMessage(string lastRunLabel = "last")
     {
       var modes = new List<string>();
       if (_rhino) modes.Add("Rhino");
@@ -260,7 +333,7 @@ namespace AutoInternalise
       {
         text = $"Auto {string.Join("+", modes)} / 15 min";
         if (_autoTimer?.Enabled ?? false) text += $" · next {_nextAutoRun:HH:mm}";
-        else if (_lastAutoRun != DateTime.MinValue) text += $" · last {_lastAutoRun:HH:mm}";
+        else if (_lastAutoRun != DateTime.MinValue) text += $" · {lastRunLabel} {_lastAutoRun:HH:mm}";
       }
 
       if (Message == text) return;
@@ -280,7 +353,7 @@ namespace AutoInternalise
         // The toggles may have been switched off, or the component removed, while waiting.
         if (!(_rhino || _revit) || !ReferenceEquals(d, _hookedDoc)) return;
 
-        Internalise(d, rhinoReferences: _rhino, wiredFilter: _revit ? IsRevitElementType : (Func<Type, bool>)null);
+        Internalise(d, rhinoReferences: _rhino, revitBoundary: _revit, wiredAll: false);
         _lastAutoRun = DateTime.Now;
         UpdateMessage();
         ExpireSolution(false);
@@ -294,21 +367,69 @@ namespace AutoInternalise
       doc.ScheduleSolution(5, d =>
       {
         if (!ReferenceEquals(d, _hookedDoc)) return;
-        Internalise(d, rhinoReferences: true, wiredFilter: _ => true);
+        Internalise(d, rhinoReferences: true, revitBoundary: false, wiredAll: true);
         ExpireSolution(false);
       });
     }
 
     /// <summary>
-    /// True for Rhino.Inside.Revit element data types. Matched by name so this plugin also loads without Rhino.Inside.Revit.
+    /// True for types from Rhino.Inside.Revit. Matched by assembly name so this plugin also loads without it.
     /// </summary>
-    private static bool IsRevitElementType(Type itemType)
+    private static bool IsRevitType(Type type) =>
+      type.Assembly.GetName().Name.StartsWith("RhinoInside.Revit", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True if the data reaching this source comes (possibly via relays or panels) from a Rhino.Inside.Revit object.</summary>
+    private static bool ComesFromRevit(IGH_Param source, int depth = 0)
     {
-      const string ElementInterface = "RhinoInside.Revit.GH.Types.IGH_Element";
-      if (itemType.FullName == ElementInterface) return true;
-      foreach (var i in itemType.GetInterfaces())
-        if (i.FullName == ElementInterface) return true;
+      if (depth > 32) return false;
+      var top = TopLevel(source);
+      if (IsRevitType(top.GetType())) return true;
+
+      // Pass-through objects that can't be internalized themselves (Relay, Panel...): look further upstream.
+      if (ReferenceEquals(top, source) && PersistentItemType(source.GetType()) == null)
+        return source.Sources.Any(s => ComesFromRevit(s, depth + 1));
       return false;
+    }
+
+    /// <summary>
+    /// The first regular Grasshopper parameters that data from Rhino.Inside.Revit flows into. Internalizing these
+    /// makes everything downstream independent of Revit.
+    /// </summary>
+    private IEnumerable<(IGH_Param, Type)> FindRevitBoundaryParams(GH_Document doc)
+    {
+      foreach (var param in AllParams(doc))
+      {
+        if (param.SourceCount == 0 || _revitSkipped.Contains(param)) continue;
+        if (IsRevitType(TopLevel(param).GetType())) continue;
+
+        var itemType = PersistentItemType(param.GetType());
+        if (itemType == null || IsRevitType(itemType)) continue;
+
+        if (param.Sources.Any(s => ComesFromRevit(s)))
+          yield return (param, itemType);
+      }
+    }
+
+    /// <summary>
+    /// Checks the data can be stored standalone. Returns a reason if not: Revit didn't deliver anything
+    /// (not running, model closed, error), which must never overwrite good data, or the data holds Revit objects.
+    /// </summary>
+    private static string RevitCaptureProblem(IGH_Param param)
+    {
+      foreach (var source in param.Sources)
+      {
+        if (TopLevel(source) is IGH_ActiveObject active && IsRevitType(active.GetType()) &&
+            active.RuntimeMessageLevel == GH_RuntimeMessageLevel.Error)
+          return "the Revit component upstream has an error";
+      }
+
+      var data = param.VolatileData;
+      if (data == null || data.DataCount == 0)
+        return "no data from Revit (is Revit running with the model open?)";
+      if (data.AllData(true).Any(g => IsRevitType(g.GetType())))
+        return "the data contains Revit elements, which can't exist without Revit; " +
+               "feed it through Element Geometry or another component that outputs Rhino data";
+      return null;
     }
 
     private void HookCanvas()
@@ -351,8 +472,10 @@ namespace AutoInternalise
     }
 
     /// <param name="rhinoReferences">Internalize geometry referenced from the Rhino file.</param>
-    /// <param name="wiredFilter">If not null, also internalize wired parameters whose data type passes this filter.</param>
-    private void Internalise(GH_Document doc, bool rhinoReferences, Func<Type, bool> wiredFilter)
+    /// <param name="revitBoundary">Internalize the first regular parameters fed by Rhino.Inside.Revit.</param>
+    /// <param name="wiredAll">Internalize every wired parameter.</param>
+    /// <returns>Number of parameters changed.</returns>
+    private int Internalise(GH_Document doc, bool rhinoReferences, bool revitBoundary, bool wiredAll)
     {
       var undo = new GH_UndoRecord("Auto internalize");
       var changed = new List<IGH_Param>();
@@ -367,15 +490,28 @@ namespace AutoInternalise
         if (_details.Count > before) changed.Add(param);
       }
 
-      if (wiredFilter != null)
+      var wired = wiredAll ? FindWiredParams(doc).ToList()
+                : revitBoundary ? FindRevitBoundaryParams(doc).ToList()
+                : new List<(IGH_Param, Type)>();
+      foreach (var (param, itemType) in wired)
       {
-        foreach (var (param, itemType) in FindWiredParams(doc, wiredFilter).ToList())
+        if (!wiredAll)
         {
-          undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
-          InternaliseWiredMethod.MakeGenericMethod(itemType)
-            .Invoke(null, new object[] { param, NodeTitle(param), _failedIds, _details, _failed });
-          changed.Add(param);
+          var problem = RevitCaptureProblem(param);
+          if (problem != null)
+          {
+            var message = $"{NodeTitle(param)}: {problem}";
+            if (!_failed.Contains(message)) _failed.Add(message);
+            // Revit objects in the data won't go away by retrying; missing data might (Revit/model opened later).
+            if (problem.StartsWith("the data contains")) _revitSkipped.Add(param);
+            continue;
+          }
         }
+
+        undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
+        InternaliseWiredMethod.MakeGenericMethod(itemType)
+          .Invoke(null, new object[] { param, NodeTitle(param), _failedIds, _details, _failed });
+        changed.Add(param);
       }
 
       if (undo.ActionCount > 0)
@@ -392,6 +528,7 @@ namespace AutoInternalise
         HookCanvas();
         Grasshopper.Instances.InvalidateCanvas();
       }
+      return changed.Count;
     }
 
     private IEnumerable<IGH_Param> AllParams(GH_Document doc)
@@ -408,13 +545,13 @@ namespace AutoInternalise
       }
     }
 
-    private IEnumerable<(IGH_Param, Type)> FindWiredParams(GH_Document doc, Func<Type, bool> filter)
+    private IEnumerable<(IGH_Param, Type)> FindWiredParams(GH_Document doc)
     {
       foreach (var param in AllParams(doc))
       {
         if (param.SourceCount == 0) continue;
         var itemType = PersistentItemType(param.GetType());
-        if (itemType != null && filter(itemType))
+        if (itemType != null)
           yield return (param, itemType);
       }
     }
