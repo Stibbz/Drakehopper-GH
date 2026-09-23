@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Reflection;
 using System.Drawing.Drawing2D;
+using System.Linq;
+using System.Reflection;
 using Grasshopper.GUI.Canvas;
 using Grasshopper.Kernel;
 using Grasshopper.Kernel.Data;
@@ -16,7 +17,7 @@ namespace AutoInternalise
   public class AutoInternaliseInfo : GH_AssemblyInfo
   {
     public override string Name => "AutoInternalise";
-    public override string Description => "Internalizes Rhino-referenced (and optionally wired) parameters in the document.";
+    public override string Description => "Internalizes Rhino-referenced, Revit and wired parameters in the document.";
     public override Guid Id => new Guid("3c8b85a1-4660-4ed7-b408-9ac3d5225454");
     public override string AuthorName => "";
     public override string AuthorContact => "";
@@ -29,34 +30,42 @@ namespace AutoInternalise
     private static readonly MethodInfo InternaliseReferencesMethod =
       typeof(AutoInternaliseComponent).GetMethod(nameof(InternaliseReferencesTyped), BindingFlags.NonPublic | BindingFlags.Static);
 
+    // Rhino and Revit auto modes share one cooldown. The wait uses its own timer because
+    // GH_Document.ScheduleSolution fires all callbacks at the earliest scheduled time, so a long delay there
+    // would be cut short by any other scheduled solution.
+    private static readonly TimeSpan AutoInterval = TimeSpan.FromMinutes(15);
+
     private bool _rhino;
-    private bool _all;
     private bool _revit;
-    private bool _pendingRhino;
+    private bool _all;
     private GH_Document _hookedDoc;
 
-    // Automatic Rhino internalization runs at most once per interval; switching the toggle on resets it.
-    // The wait uses its own timer because GH_Document.ScheduleSolution fires all callbacks at the earliest
-    // scheduled time, so a long delay there would be cut short by any other scheduled solution.
-    private static readonly TimeSpan RhinoInterval = TimeSpan.FromMinutes(15);
-    private DateTime _lastRhinoRun = DateTime.MinValue;
-    private System.Windows.Forms.Timer _rhinoTimer;
+    private bool _pendingAuto;
+    private bool _pendingRefresh;
+    private DateTime _lastAutoRun = DateTime.MinValue;
+    private DateTime _nextAutoRun;
+    private System.Windows.Forms.Timer _autoTimer;
 
-    // Rhino objects that could not be loaded; they are not retried until a toggle is switched on again,
-    // otherwise every solution would schedule another attempt.
+    // Session state, cleared when a toggle is switched on.
+    // Rhino objects that could not be loaded are not retried, otherwise every solution would schedule another attempt.
     private readonly HashSet<Guid> _failedIds = new HashSet<Guid>();
-    private readonly List<string> _internalized = new List<string>();
+    private readonly List<string> _nodes = new List<string>();
+    private readonly List<string> _details = new List<string>();
     private readonly List<string> _failed = new List<string>();
-
-    // Top-level objects that had something internalized; outlined on the canvas until a toggle is switched on again.
     private readonly HashSet<IGH_DocumentObject> _highlighted = new HashSet<IGH_DocumentObject>();
+
+    // Everything internalized in the file, however it got there.
+    private List<string> _fileInternalized = new List<string>();
+    // Signature of each component input's default persistent data, so default values don't count as internalized.
+    private readonly Dictionary<string, string> _defaultSignatures = new Dictionary<string, string>();
+
     private static readonly Color HighlightColor = Color.FromArgb(255, 140, 0);
     private GH_Canvas _paintCanvas;
 
     public AutoInternaliseComponent()
       : base("Auto Internalise", "AutoInt",
-             "Internalizes geometry referenced from the Rhino file (continuously) so the definition keeps working " +
-             "without it, or internalizes everything that supports it (once).",
+             "Rhino and Revit: while true, internalizes automatically, at most once every 15 minutes (shared). " +
+             "All: internalizes everything once when switched on. Internalized nodes are outlined in orange.",
              "Params", "Util")
     { }
 
@@ -66,25 +75,31 @@ namespace AutoInternalise
 
     protected override void RegisterInputParams(GH_InputParamManager pManager)
     {
-      pManager.AddBooleanParameter("Internalize Rhino Elements", "Rhino",
-        "While true, geometry referenced from the Rhino file is internalized automatically (also when you set new references).",
+      pManager.AddBooleanParameter("Auto Rhino (every 15 min)", "Rhino 15m",
+        "CONTINUOUS. While true, geometry referenced from the Rhino file is internalized automatically, " +
+        "at most once every 15 minutes (cooldown shared with Revit). Switching it on runs immediately.",
         GH_ParamAccess.item, false);
-      pManager.AddBooleanParameter("Internalize All", "All",
-        "When this becomes true, every parameter that supports it is internalized once: Rhino references as well as " +
-        "parameters with incoming wires (the wires are removed).",
-        GH_ParamAccess.item, false);
-      pManager.AddBooleanParameter("Internalize Revit Elements", "Revit",
-        "When this becomes true, every Rhino.Inside.Revit element parameter with incoming wires (e.g. the Elements input " +
-        "of Element Geometry fed by a Graphical Element) is internalized once and its wires are removed. " +
+      pManager.AddBooleanParameter("Auto Revit (every 15 min)", "Revit 15m",
+        "CONTINUOUS. While true, every Rhino.Inside.Revit element parameter with incoming wires (e.g. the Elements input " +
+        "of Element Geometry fed by a Graphical Element) is internalized and its wires removed, at most once every " +
+        "15 minutes (cooldown shared with Rhino). Switching it on runs immediately. " +
         "Note: this stores element references (UniqueIds); the Revit model must still be open to get their geometry.",
+        GH_ParamAccess.item, false);
+      pManager.AddBooleanParameter("Internalize All (once)", "All once",
+        "ONE-OFF. When this switches to true, every parameter that supports it is internalized once: Rhino references " +
+        "as well as parameters with incoming wires (the wires are removed).",
         GH_ParamAccess.item, false);
     }
 
     protected override void RegisterOutputParams(GH_OutputParamManager pManager)
     {
-      pManager.AddTextParameter("Internalized", "I",
-        "What was internalized since a toggle was last switched on: parameter, Rhino object ID, type, name and layer.",
-        GH_ParamAccess.list);
+      pManager.AddTextParameter("Internalized Nodes", "Nodes",
+        "Nodes internalized by this component since a toggle was last switched on.", GH_ParamAccess.list);
+      pManager.AddTextParameter("All Internalized Nodes", "All",
+        "Every node in this file that holds internalized data, whether internalized manually or by this component. " +
+        "Default values of component inputs and still-linked Rhino references are not counted.", GH_ParamAccess.list);
+      pManager.AddTextParameter("Details", "D",
+        "Per item: node, Rhino object ID, type, name and layer, or the number of items taken from wires.", GH_ParamAccess.list);
       pManager.AddTextParameter("Failed", "F",
         "Rhino references that could not be loaded (object not in the open Rhino file), so they are still references.",
         GH_ParamAccess.list);
@@ -119,7 +134,7 @@ namespace AutoInternalise
 
     private void Unhook()
     {
-      StopRhinoTimer();
+      StopAutoTimer();
       UnhookCanvas();
       if (_hookedDoc != null) _hookedDoc.SolutionEnd -= OnSolutionEnd;
       _hookedDoc = null;
@@ -127,105 +142,159 @@ namespace AutoInternalise
 
     protected override void SolveInstance(IGH_DataAccess DA)
     {
-      bool rhino = false, all = false, revit = false;
+      bool rhino = false, revit = false, all = false;
       DA.GetData(0, ref rhino);
-      DA.GetData(1, ref all);
-      DA.GetData(2, ref revit);
+      DA.GetData(1, ref revit);
+      DA.GetData(2, ref all);
 
       bool rhinoRisingEdge = rhino && !_rhino;
-      bool allRisingEdge = all && !_all;
       bool revitRisingEdge = revit && !_revit;
+      bool allRisingEdge = all && !_all;
       _rhino = rhino;
-      _all = all;
       _revit = revit;
+      _all = all;
 
-      if (rhinoRisingEdge || allRisingEdge || revitRisingEdge)
+      if (rhinoRisingEdge || revitRisingEdge || allRisingEdge)
       {
         _failedIds.Clear();
-        _internalized.Clear();
+        _nodes.Clear();
+        _details.Clear();
         _failed.Clear();
         _highlighted.Clear();
         Grasshopper.Instances.InvalidateCanvas();
       }
-      if (rhinoRisingEdge)
-        _lastRhinoRun = DateTime.MinValue;
-      if (rhinoRisingEdge || !rhino)
-        StopRhinoTimer();
-      if (!rhino)
-        Message = null;
 
-      DA.SetDataList(0, _internalized);
-      DA.SetDataList(1, _failed);
+      // Switching an auto mode on runs straight away (the check happens at the end of this solution).
+      if (rhinoRisingEdge || revitRisingEdge)
+      {
+        _lastAutoRun = DateTime.MinValue;
+        StopAutoTimer();
+      }
+      if (!rhino && !revit)
+        StopAutoTimer();
+      UpdateMessage();
+
+      var doc = OnPingDocument();
+      if (doc != null)
+        _fileInternalized = FindFileInternalized(doc);
+
+      DA.SetDataList(0, _nodes);
+      DA.SetDataList(1, _fileInternalized);
+      DA.SetDataList(2, _details);
+      DA.SetDataList(3, _failed);
       if (_failed.Count > 0)
         AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
           $"{_failed.Count} Rhino reference(s) could not be loaded and were left as references. See the F output.");
 
       if (allRisingEdge)
-        ScheduleOnce(OnPingDocument(), rhinoReferences: true, wiredFilter: _ => true);
-      else if (revitRisingEdge)
-        ScheduleOnce(OnPingDocument(), rhinoReferences: false, wiredFilter: IsRevitElementType);
+        ScheduleOnce(doc);
     }
 
-    // Catches references set after the toggle was switched on (e.g. "Set one curve").
     private void OnSolutionEnd(object sender, GH_SolutionEventArgs e)
     {
-      if (!_rhino || _pendingRhino || Locked || (_rhinoTimer?.Enabled ?? false)) return;
-      if (e.Document == null || FindReferencedParams(e.Document).Count == 0) return;
+      var doc = e.Document;
+      if (doc == null || Locked) return;
 
-      var wait = _lastRhinoRun + RhinoInterval - DateTime.Now;
+      RefreshFileOutput(doc);
+
+      if (!(_rhino || _revit) || _pendingAuto || (_autoTimer?.Enabled ?? false)) return;
+      if (!HasAutoWork(doc)) return;
+
+      var wait = _lastAutoRun + AutoInterval - DateTime.Now;
       if (wait <= TimeSpan.Zero)
       {
-        ScheduleRhino(e.Document);
+        ScheduleAuto(doc);
         return;
       }
 
-      if (_rhinoTimer == null)
+      if (_autoTimer == null)
       {
-        _rhinoTimer = new System.Windows.Forms.Timer();
-        _rhinoTimer.Tick += (s, a) =>
+        _autoTimer = new System.Windows.Forms.Timer();
+        _autoTimer.Tick += (s, a) =>
         {
-          StopRhinoTimer();
-          if (_rhino && _hookedDoc != null) ScheduleRhino(_hookedDoc);
+          StopAutoTimer();
+          if ((_rhino || _revit) && _hookedDoc != null) ScheduleAuto(_hookedDoc);
         };
       }
-      _rhinoTimer.Interval = Math.Max(1, (int)Math.Ceiling(wait.TotalMilliseconds));
-      _rhinoTimer.Start();
-
-      Message = $"Next: {DateTime.Now + wait:HH:mm:ss}";
-      Grasshopper.Instances.InvalidateCanvas();
+      _nextAutoRun = DateTime.Now + wait;
+      _autoTimer.Interval = Math.Max(1, (int)Math.Ceiling(wait.TotalMilliseconds));
+      _autoTimer.Start();
+      UpdateMessage();
     }
 
-    private void StopRhinoTimer()
+    /// <summary>Re-solves this component when the file-wide list changed (e.g. after a manual internalize).</summary>
+    private void RefreshFileOutput(GH_Document doc)
     {
-      _rhinoTimer?.Stop();
-    }
+      if (_pendingRefresh) return;
+      var list = FindFileInternalized(doc);
+      if (list.SequenceEqual(_fileInternalized)) return;
 
-    // The document must not be modified during a solution, so the work is deferred to a scheduled solution.
-    private void ScheduleRhino(GH_Document doc)
-    {
-      if (doc == null || _pendingRhino) return;
-      _pendingRhino = true;
+      _fileInternalized = list;
+      _pendingRefresh = true;
       doc.ScheduleSolution(5, d =>
       {
-        _pendingRhino = false;
-        // The toggle may have been switched off, or the component removed, while waiting.
-        if (!_rhino || !ReferenceEquals(d, _hookedDoc)) return;
-
-        Internalise(d, rhinoReferences: true, wiredFilter: null);
-        _lastRhinoRun = DateTime.Now;
-        Message = null;
+        _pendingRefresh = false;
         ExpireSolution(false);
       });
     }
 
-    /// <summary>One-off run, triggered when a toggle switches on.</summary>
-    private void ScheduleOnce(GH_Document doc, bool rhinoReferences, Func<Type, bool> wiredFilter)
+    private bool HasAutoWork(GH_Document doc) =>
+      (_rhino && FindReferencedParams(doc).Count > 0) ||
+      (_revit && FindWiredParams(doc, IsRevitElementType).Any());
+
+    private void StopAutoTimer()
+    {
+      _autoTimer?.Stop();
+    }
+
+    private void UpdateMessage()
+    {
+      var modes = new List<string>();
+      if (_rhino) modes.Add("Rhino");
+      if (_revit) modes.Add("Revit");
+
+      string text;
+      if (modes.Count == 0)
+        text = "Auto: off";
+      else
+      {
+        text = $"Auto {string.Join("+", modes)} / 15 min";
+        if (_autoTimer?.Enabled ?? false) text += $" · next {_nextAutoRun:HH:mm}";
+        else if (_lastAutoRun != DateTime.MinValue) text += $" · last {_lastAutoRun:HH:mm}";
+      }
+
+      if (Message == text) return;
+      Message = text;
+      Attributes?.ExpireLayout();
+      Grasshopper.Instances.RedrawCanvas();
+    }
+
+    // The document must not be modified during a solution, so the work is deferred to a scheduled solution.
+    private void ScheduleAuto(GH_Document doc)
+    {
+      if (doc == null || _pendingAuto) return;
+      _pendingAuto = true;
+      doc.ScheduleSolution(5, d =>
+      {
+        _pendingAuto = false;
+        // The toggles may have been switched off, or the component removed, while waiting.
+        if (!(_rhino || _revit) || !ReferenceEquals(d, _hookedDoc)) return;
+
+        Internalise(d, rhinoReferences: _rhino, wiredFilter: _revit ? IsRevitElementType : (Func<Type, bool>)null);
+        _lastAutoRun = DateTime.Now;
+        UpdateMessage();
+        ExpireSolution(false);
+      });
+    }
+
+    /// <summary>Internalize All: one-off run, triggered when the toggle switches on.</summary>
+    private void ScheduleOnce(GH_Document doc)
     {
       if (doc == null) return;
       doc.ScheduleSolution(5, d =>
       {
         if (!ReferenceEquals(d, _hookedDoc)) return;
-        Internalise(d, rhinoReferences, wiredFilter);
+        Internalise(d, rhinoReferences: true, wiredFilter: _ => true);
         ExpireSolution(false);
       });
     }
@@ -281,49 +350,48 @@ namespace AutoInternalise
       }
     }
 
-    /// <summary>Internalizes and returns the top-level objects that actually changed.</summary>
     /// <param name="rhinoReferences">Internalize geometry referenced from the Rhino file.</param>
     /// <param name="wiredFilter">If not null, also internalize wired parameters whose data type passes this filter.</param>
-    private HashSet<IGH_DocumentObject> Internalise(GH_Document doc, bool rhinoReferences, Func<Type, bool> wiredFilter)
+    private void Internalise(GH_Document doc, bool rhinoReferences, Func<Type, bool> wiredFilter)
     {
       var undo = new GH_UndoRecord("Auto internalize");
-      var changed = new HashSet<IGH_DocumentObject>();
+      var changed = new List<IGH_Param>();
 
       var referenced = rhinoReferences ? FindReferencedParams(doc) : new List<(IGH_Param, Type)>();
       foreach (var (param, itemType) in referenced)
       {
         undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
-        int before = _internalized.Count;
+        int before = _details.Count;
         InternaliseReferencesMethod.MakeGenericMethod(itemType)
-          .Invoke(null, new object[] { param, ParamLabel(param), _failedIds, _internalized, _failed });
-        if (_internalized.Count > before) changed.Add(TopLevel(param));
+          .Invoke(null, new object[] { param, NodeTitle(param), _failedIds, _details, _failed });
+        if (_details.Count > before) changed.Add(param);
       }
 
       if (wiredFilter != null)
       {
-        foreach (var param in AllParams(doc))
+        foreach (var (param, itemType) in FindWiredParams(doc, wiredFilter).ToList())
         {
-          if (param.SourceCount == 0) continue;
-          var itemType = PersistentItemType(param.GetType());
-          if (itemType == null || !wiredFilter(itemType)) continue;
-
           undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
           InternaliseWiredMethod.MakeGenericMethod(itemType)
-            .Invoke(null, new object[] { param, ParamLabel(param), _failedIds, _internalized, _failed });
-          changed.Add(TopLevel(param));
+            .Invoke(null, new object[] { param, NodeTitle(param), _failedIds, _details, _failed });
+          changed.Add(param);
         }
       }
 
       if (undo.ActionCount > 0)
         doc.UndoUtil.RecordEvent(undo);
 
+      foreach (var param in changed)
+      {
+        var title = NodeTitle(param);
+        if (!_nodes.Contains(title)) _nodes.Add(title);
+        _highlighted.Add(TopLevel(param));
+      }
       if (changed.Count > 0)
       {
-        _highlighted.UnionWith(changed);
         HookCanvas();
         Grasshopper.Instances.InvalidateCanvas();
       }
-      return changed;
     }
 
     private IEnumerable<IGH_Param> AllParams(GH_Document doc)
@@ -340,6 +408,17 @@ namespace AutoInternalise
       }
     }
 
+    private IEnumerable<(IGH_Param, Type)> FindWiredParams(GH_Document doc, Func<Type, bool> filter)
+    {
+      foreach (var param in AllParams(doc))
+      {
+        if (param.SourceCount == 0) continue;
+        var itemType = PersistentItemType(param.GetType());
+        if (itemType != null && filter(itemType))
+          yield return (param, itemType);
+      }
+    }
+
     /// <summary>Parameters whose internal (persistent) data still contains loadable Rhino references.</summary>
     private List<(IGH_Param, Type)> FindReferencedParams(GH_Document doc)
     {
@@ -351,8 +430,7 @@ namespace AutoInternalise
         var itemType = PersistentItemType(param.GetType());
         if (itemType == null || !typeof(IGH_GeometricGoo).IsAssignableFrom(itemType)) continue;
 
-        var data = (IGH_Structure)param.GetType().GetProperty("PersistentData").GetValue(param);
-        foreach (var goo in data.AllData(true))
+        foreach (var goo in PersistentData(param).AllData(true))
         {
           if (goo is IGH_GeometricGoo geo && geo.IsReferencedGeometry && !_failedIds.Contains(geo.ReferenceID))
           {
@@ -364,10 +442,67 @@ namespace AutoInternalise
       return result;
     }
 
-    private static string ParamLabel(IGH_Param param)
+    /// <summary>
+    /// Titles of all nodes that hold internalized data: no wires, persistent data present, no Rhino links left,
+    /// and for component inputs, data that differs from the component's default.
+    /// </summary>
+    private List<string> FindFileInternalized(GH_Document doc)
     {
-      var top = param.Attributes?.GetTopLevel?.DocObject;
-      return top != null && !ReferenceEquals(top, param) ? $"{top.NickName}.{param.NickName}" : param.NickName;
+      var result = new List<string>();
+      foreach (var param in AllParams(doc))
+      {
+        if (param.SourceCount > 0 || PersistentItemType(param.GetType()) == null) continue;
+
+        var data = PersistentData(param);
+        if (data == null || data.DataCount == 0) continue;
+        if (data.AllData(true).Any(g => g is IGH_GeometricGoo geo && geo.IsReferencedGeometry)) continue;
+
+        if (TopLevel(param) is IGH_Component comp && IsDefaultInput(comp, param, data)) continue;
+
+        result.Add(NodeTitle(param));
+      }
+      return result;
+    }
+
+    private bool IsDefaultInput(IGH_Component comp, IGH_Param input, IGH_Structure data)
+    {
+      var key = comp.ComponentGuid + "|" + input.Name;
+      if (!_defaultSignatures.TryGetValue(key, out var defaultSignature))
+      {
+        defaultSignature = null;
+        try
+        {
+          if (Grasshopper.Instances.ComponentServer.EmitObject(comp.ComponentGuid) is IGH_Component fresh)
+          {
+            var freshInput = fresh.Params.Input.FirstOrDefault(p => p.Name == input.Name);
+            var freshData = freshInput != null ? PersistentData(freshInput) : null;
+            if (freshData != null && freshData.DataCount > 0)
+              defaultSignature = Signature(freshData);
+          }
+        }
+        catch
+        {
+          // Components that can't be created on their own are treated as having no defaults.
+        }
+        _defaultSignatures[key] = defaultSignature;
+      }
+      return defaultSignature != null && Signature(data) == defaultSignature;
+    }
+
+    private static string Signature(IGH_Structure data) =>
+      data.PathCount + "|" + string.Join("\u001f", data.AllData(false).Select(g => g?.ToString() ?? ""));
+
+    private static IGH_Structure PersistentData(IGH_Param param) =>
+      param.GetType().GetProperty("PersistentData")?.GetValue(param) as IGH_Structure;
+
+    private static string Title(IGH_DocumentObject obj) =>
+      !string.IsNullOrEmpty(obj.NickName) && obj.NickName != obj.Name ? $"{obj.NickName} ({obj.Name})" : obj.Name;
+
+    /// <summary>"Curve", "Site (Curve)" or "Element Geometry > Elements".</summary>
+    private static string NodeTitle(IGH_Param param)
+    {
+      var top = TopLevel(param);
+      return ReferenceEquals(top, param) ? Title(param) : $"{Title(top)} > {param.Name}";
     }
 
     private static IGH_DocumentObject TopLevel(IGH_Param param) =>
@@ -402,7 +537,7 @@ namespace AutoInternalise
 
     /// <summary>Same as Grasshopper's own "Internalise data": load the geometry, then drop the Rhino object ID.</summary>
     private static void DestroyReferences<T>(GH_PersistentParam<T> param, string label,
-      HashSet<Guid> failedIds, List<string> internalized, List<string> failed) where T : class, IGH_Goo
+      HashSet<Guid> failedIds, List<string> details, List<string> failed) where T : class, IGH_Goo
     {
       foreach (var goo in param.PersistentData.AllData(true))
       {
@@ -415,7 +550,7 @@ namespace AutoInternalise
         if (geo.IsGeometryLoaded || geo.LoadGeometry())
         {
           geo.ReferenceID = Guid.Empty;
-          internalized.Add(description);
+          details.Add(description);
         }
         else
         {
@@ -426,14 +561,14 @@ namespace AutoInternalise
     }
 
     private static void InternaliseReferencesTyped<T>(GH_PersistentParam<T> param, string label,
-      HashSet<Guid> failedIds, List<string> internalized, List<string> failed) where T : class, IGH_Goo
+      HashSet<Guid> failedIds, List<string> details, List<string> failed) where T : class, IGH_Goo
     {
-      DestroyReferences(param, label, failedIds, internalized, failed);
+      DestroyReferences(param, label, failedIds, details, failed);
       param.ExpireSolution(false);
     }
 
     private static void InternaliseWiredTyped<T>(GH_PersistentParam<T> param, string label,
-      HashSet<Guid> failedIds, List<string> internalized, List<string> failed) where T : class, IGH_Goo
+      HashSet<Guid> failedIds, List<string> details, List<string> failed) where T : class, IGH_Goo
     {
       // Deep copy of the current (volatile) data.
       var data = new GH_Structure<T>((GH_Structure<T>)param.VolatileData, false);
@@ -444,10 +579,10 @@ namespace AutoInternalise
 
       int wires = param.SourceCount;
       param.RemoveAllSources();
-      internalized.Add($"{label}: {data.DataCount} item(s) from {wires} wire(s)");
+      details.Add($"{label}: {data.DataCount} item(s) from {wires} wire(s)");
 
       // Data flowing in from a referencing parameter carries the Rhino IDs along; drop them too.
-      DestroyReferences(param, label, failedIds, internalized, failed);
+      DestroyReferences(param, label, failedIds, details, failed);
       param.ExpireSolution(false);
     }
   }
