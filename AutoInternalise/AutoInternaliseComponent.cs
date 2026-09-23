@@ -26,7 +26,8 @@ namespace AutoInternalise
     private static readonly MethodInfo InternaliseReferencesMethod =
       typeof(AutoInternaliseComponent).GetMethod(nameof(InternaliseReferencesTyped), BindingFlags.NonPublic | BindingFlags.Static);
 
-    private bool _run;
+    private bool _rhino;
+    private bool _all;
     private bool _pending;
     private int _referencedCount;
     private int _wiredCount;
@@ -35,8 +36,8 @@ namespace AutoInternalise
 
     public AutoInternaliseComponent()
       : base("Auto Internalise", "AutoInt",
-             "While Run is true, any geometry referenced from the Rhino file is internalised automatically, " +
-             "so the definition keeps working without the Rhino file. Optionally also internalises wired inputs.",
+             "Internalizes geometry referenced from the Rhino file (continuously) so the definition keeps working " +
+             "without it, or internalizes everything that supports it (once).",
              "Params", "Util")
     { }
 
@@ -46,11 +47,12 @@ namespace AutoInternalise
 
     protected override void RegisterInputParams(GH_InputParamManager pManager)
     {
-      pManager.AddBooleanParameter("Run", "R",
-        "While true, Rhino-referenced geometry is internalised automatically (also when you set new references).",
+      pManager.AddBooleanParameter("Internalize Rhino Elements", "Rhino",
+        "While true, geometry referenced from the Rhino file is internalized automatically (also when you set new references).",
         GH_ParamAccess.item, false);
-      pManager.AddBooleanParameter("Wired", "W",
-        "If true, parameters with incoming wires are also internalised (wires are removed). Runs once when Run becomes true.",
+      pManager.AddBooleanParameter("Internalize All", "All",
+        "When this becomes true, every parameter that supports it is internalized once: Rhino references as well as " +
+        "parameters with incoming wires (the wires are removed).",
         GH_ParamAccess.item, false);
     }
 
@@ -95,9 +97,9 @@ namespace AutoInternalise
 
     protected override void SolveInstance(IGH_DataAccess DA)
     {
-      bool run = false, wired = false;
-      DA.GetData(0, ref run);
-      DA.GetData(1, ref wired);
+      bool rhino = false, all = false;
+      DA.GetData(0, ref rhino);
+      DA.GetData(1, ref all);
 
       DA.SetData(0, _referencedCount);
       DA.SetData(1, _wiredCount);
@@ -105,17 +107,19 @@ namespace AutoInternalise
         AddRuntimeMessage(GH_RuntimeMessageLevel.Warning,
           $"{_failedCount} referenced object(s) could not be loaded from Rhino and were left as references.");
 
-      bool risingEdge = run && !_run;
-      _run = run;
+      _rhino = rhino;
 
-      if (risingEdge && wired)
+      bool allRisingEdge = all && !_all;
+      _all = all;
+
+      if (allRisingEdge)
         Schedule(OnPingDocument(), includeWired: true);
     }
 
     // Catches references set after Run became true (e.g. "Set one curve").
     private void OnSolutionEnd(object sender, GH_SolutionEventArgs e)
     {
-      if (!_run || _pending || Locked) return;
+      if (!_rhino || _pending || Locked) return;
       if (e.Document != null && FindReferencedParams(e.Document).Count > 0)
         Schedule(e.Document, includeWired: false);
     }
