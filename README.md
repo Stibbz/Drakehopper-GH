@@ -5,6 +5,7 @@ Custom Grasshopper components for Rhino 8, written in C#.
 | Component | Folder | What it does |
 |---|---|---|
 | Auto Internalise | [`AutoInternalise/`](AutoInternalise) | Keeps a definition runnable on its own by internalizing data referenced from Rhino and Rhino.Inside.Revit. |
+| Segment Polyline | [`SegmentPolyline/`](SegmentPolyline) | Splits a polyline into straight runs of whole elements within a deviation and angle limit (Py3 script). |
 
 ## Auto Internalise
 
@@ -59,6 +60,38 @@ single undo step.
 - **Not covered:** components that read the Rhino model at runtime instead of holding a reference, such as
   Geometry Pipeline, the Rhino 8 model components (Query Model Objects, Model Object, …) and scripts that
   read the Rhino document.
+
+## Segment Polyline
+
+Python (Py3) script component, no build needed. Script: [`SegmentPolyline/segment_polyline.py`](SegmentPolyline/segment_polyline.py).
+
+Splits a reference polyline into straight runs made of whole elements (default 1400 mm each). Each run holds
+at least `min_elem` elements, starts and ends on the curve, and stays within `max_deviation` of it. The angle
+between consecutive runs never exceeds `max_angle`. Each run is made as long as the rules allow.
+
+### Inputs
+
+| Input | Type | Meaning |
+|---|---|---|
+| `curve` | Curve | Reference polyline. |
+| `min_elem` | int | Minimum elements per straight run (10 = 10 x element length). |
+| `max_deviation` | float | Maximum distance from the reference curve, in mm. |
+| `elem_len` | float, optional | Element length in mm (default 1400). |
+| `max_angle` | float, optional | Maximum angle between runs, in degrees (default 5). |
+
+### Outputs
+
+| Output | Contents |
+|---|---|
+| `polyline` | The segmented polyline. |
+| `points` | Start and end points of each run. |
+| `info` | Report: number of sections, max angle, max deviation, and the reason if it fails or leaves part of the curve unsegmented. |
+
+### Setup
+
+1. Add a Py3 script component and paste the script.
+2. Rename the inputs and outputs to match the names above, set the type hints and Item Access, and remove the default `out` output.
+3. Optional: select the component and use Create User Object to save it as a `.ghuser`.
 
 ## Building
 
