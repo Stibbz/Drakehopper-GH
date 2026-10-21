@@ -145,6 +145,9 @@ namespace AutoInternalise
     private void Unhook()
     {
       StopAutoTimer();
+      _autoTimer?.Dispose();
+      _autoTimer = null;
+      _pendingAuto = _pendingSave = _pendingRefresh = false;
       UnhookCanvas();
       if (_hookedDoc != null)
       {
@@ -181,11 +184,18 @@ namespace AutoInternalise
       doc.ScheduleSolution(5, d =>
       {
         _pendingSave = false;
-        if (!(_rhino || _revit) || !ReferenceEquals(d, _hookedDoc)) return;
+        if (!(_rhino || _revit) || Locked || !ReferenceEquals(d, _hookedDoc)) return;
 
         StopAutoTimer();
-        int changed = Internalise(d, rhinoReferences: _rhino, revitBoundary: _revit, wiredAll: false);
-        _lastAutoRun = DateTime.Now;
+        int changed = 0;
+        try
+        {
+          changed = Internalise(d, rhinoReferences: _rhino, revitBoundary: _revit, wiredAll: false);
+        }
+        finally
+        {
+          _lastAutoRun = DateTime.Now;
+        }
         if (changed == 0)
         {
           UpdateMessage();
@@ -233,6 +243,7 @@ namespace AutoInternalise
         _failed.Clear();
         _highlighted.Clear();
         _revitSkipped.Clear();
+        _defaultSignatures.Clear();
         Grasshopper.Instances.InvalidateCanvas();
       }
 
@@ -265,6 +276,7 @@ namespace AutoInternalise
     private void OnSolutionEnd(object sender, GH_SolutionEventArgs e)
     {
       var doc = e.Document;
+      if (Locked) StopAutoTimer();
       if (doc == null || Locked) return;
 
       _seenSolution = true;
@@ -286,7 +298,7 @@ namespace AutoInternalise
         _autoTimer.Tick += (s, a) =>
         {
           StopAutoTimer();
-          if ((_rhino || _revit) && _hookedDoc != null) ScheduleAuto(_hookedDoc);
+          if ((_rhino || _revit) && !Locked && _hookedDoc != null) ScheduleAuto(_hookedDoc);
         };
       }
       _nextAutoRun = DateTime.Now + wait;
@@ -351,10 +363,16 @@ namespace AutoInternalise
       {
         _pendingAuto = false;
         // The toggles may have been switched off, or the component removed, while waiting.
-        if (!(_rhino || _revit) || !ReferenceEquals(d, _hookedDoc)) return;
+        if (!(_rhino || _revit) || Locked || !ReferenceEquals(d, _hookedDoc)) return;
 
-        Internalise(d, rhinoReferences: _rhino, revitBoundary: _revit, wiredAll: false);
-        _lastAutoRun = DateTime.Now;
+        try
+        {
+          Internalise(d, rhinoReferences: _rhino, revitBoundary: _revit, wiredAll: false);
+        }
+        finally
+        {
+          _lastAutoRun = DateTime.Now;
+        }
         UpdateMessage();
         ExpireSolution(false);
       });
@@ -366,7 +384,7 @@ namespace AutoInternalise
       if (doc == null) return;
       doc.ScheduleSolution(5, d =>
       {
-        if (!ReferenceEquals(d, _hookedDoc)) return;
+        if (Locked || !ReferenceEquals(d, _hookedDoc)) return;
         Internalise(d, rhinoReferences: true, revitBoundary: false, wiredAll: true);
         ExpireSolution(false);
       });
@@ -426,11 +444,14 @@ namespace AutoInternalise
       var data = param.VolatileData;
       if (data == null || data.DataCount == 0)
         return "no data from Revit (is Revit running with the model open?)";
-      if (data.AllData(true).Any(g => IsRevitType(g.GetType())))
-        return "the data contains Revit elements, which can't exist without Revit; " +
-               "feed it through Element Geometry or another component that outputs Rhino data";
+      if (data.AllData(true).Any(g => g != null && IsRevitType(g.GetType())))
+        return RevitElementsProblem;
       return null;
     }
+
+    private const string RevitElementsProblem =
+      "the data contains Revit elements, which can't exist without Revit; " +
+      "feed it through Element Geometry or another component that outputs Rhino data";
 
     private void HookCanvas()
     {
@@ -480,13 +501,16 @@ namespace AutoInternalise
       var undo = new GH_UndoRecord("Auto internalize");
       var changed = new List<IGH_Param>();
 
+      // Retry earlier failures (Rhino/Revit may be ready now); anything still failing is reported again.
+      _failedIds.Clear();
+      _failed.Clear();
+
       var referenced = rhinoReferences ? FindReferencedParams(doc) : new List<(IGH_Param, Type)>();
       foreach (var (param, itemType) in referenced)
       {
         undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
         int before = _details.Count;
-        InternaliseReferencesMethod.MakeGenericMethod(itemType)
-          .Invoke(null, new object[] { param, NodeTitle(param), _failedIds, _details, _failed });
+        if (!SafeInvoke(InternaliseReferencesMethod, itemType, param) && _details.Count <= before) continue;
         if (_details.Count > before) changed.Add(param);
       }
 
@@ -495,23 +519,20 @@ namespace AutoInternalise
                 : new List<(IGH_Param, Type)>();
       foreach (var (param, itemType) in wired)
       {
-        if (!wiredAll)
+        var problem = RevitCaptureProblem(param);
+        if (problem != null)
         {
-          var problem = RevitCaptureProblem(param);
-          if (problem != null)
-          {
-            var message = $"{NodeTitle(param)}: {problem}";
-            if (!_failed.Contains(message)) _failed.Add(message);
-            // Revit objects in the data won't go away by retrying; missing data might (Revit/model opened later).
-            if (problem.StartsWith("the data contains")) _revitSkipped.Add(param);
-            continue;
-          }
+          var message = $"{NodeTitle(param)}: {problem}";
+          if (!_failed.Contains(message)) _failed.Add(message);
+          // Revit objects in the data won't go away by retrying; missing data might (Revit/model opened later).
+          if (problem == RevitElementsProblem) _revitSkipped.Add(param);
+          continue;
         }
 
         undo.AddAction(new GH_GenericObjectAction(TopLevel(param)));
-        InternaliseWiredMethod.MakeGenericMethod(itemType)
-          .Invoke(null, new object[] { param, NodeTitle(param), _failedIds, _details, _failed });
-        changed.Add(param);
+        int beforeWired = _details.Count;
+        SafeInvoke(InternaliseWiredMethod, itemType, param);
+        if (_details.Count > beforeWired) changed.Add(param);
       }
 
       if (undo.ActionCount > 0)
@@ -531,11 +552,28 @@ namespace AutoInternalise
       return changed.Count;
     }
 
+    private bool SafeInvoke(MethodInfo method, Type itemType, IGH_Param param)
+    {
+      try
+      {
+        method.MakeGenericMethod(itemType)
+          .Invoke(null, new object[] { param, NodeTitle(param), _failedIds, _details, _failed });
+        return true;
+      }
+      catch (Exception ex)
+      {
+        var inner = (ex as TargetInvocationException)?.InnerException ?? ex;
+        var message = $"{NodeTitle(param)}: {inner.Message}";
+        if (!_failed.Contains(message)) _failed.Add(message);
+        return false;
+      }
+    }
+
     private IEnumerable<IGH_Param> AllParams(GH_Document doc)
     {
       foreach (var obj in doc.Objects)
       {
-        if (ReferenceEquals(obj, this)) continue;
+        if (obj is AutoInternaliseComponent) continue;
 
         if (obj is IGH_Param param)
           yield return param;
@@ -567,7 +605,9 @@ namespace AutoInternalise
         var itemType = PersistentItemType(param.GetType());
         if (itemType == null || !typeof(IGH_GeometricGoo).IsAssignableFrom(itemType)) continue;
 
-        foreach (var goo in PersistentData(param).AllData(true))
+        var persistent = PersistentData(param);
+        if (persistent == null) continue;
+        foreach (var goo in persistent.AllData(true))
         {
           if (goo is IGH_GeometricGoo geo && geo.IsReferencedGeometry && !_failedIds.Contains(geo.ReferenceID))
           {
@@ -662,7 +702,8 @@ namespace AutoInternalise
       var text = $"{id} {geo.TypeName}";
       var rhinoDoc = RhinoDoc.ActiveDoc;
       var obj = rhinoDoc?.Objects.FindId(id);
-      if (obj == null) return text + " (not in the open Rhino file)";
+      if (obj == null)
+        return text + (geo.IsGeometryLoaded ? " (Rhino object not found, kept loaded geometry)" : " (not in the open Rhino file)");
 
       if (!string.IsNullOrEmpty(obj.Attributes.Name))
         text += $" '{obj.Attributes.Name}'";
@@ -707,8 +748,20 @@ namespace AutoInternalise
     private static void InternaliseWiredTyped<T>(GH_PersistentParam<T> param, string label,
       HashSet<Guid> failedIds, List<string> details, List<string> failed) where T : class, IGH_Goo
     {
+      if (!(param.VolatileData is GH_Structure<T> volatileData) || volatileData.DataCount == 0)
+      {
+        var msg = $"{label}: no data available to internalize";
+        if (!failed.Contains(msg)) failed.Add(msg);
+        return;
+      }
+
       // Deep copy of the current (volatile) data.
-      var data = new GH_Structure<T>((GH_Structure<T>)param.VolatileData, false);
+      var data = new GH_Structure<T>(volatileData, false);
+
+      // The volatile data already has the data-mapping modifiers applied; keeping them would apply them twice.
+      param.DataMapping = GH_DataMapping.None;
+      param.Reverse = false;
+      param.Simplify = false;
 
       param.PersistentData.Clear();
       for (int i = 0; i < data.PathCount; i++)
