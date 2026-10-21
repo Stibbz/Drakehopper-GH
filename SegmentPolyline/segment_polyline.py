@@ -12,6 +12,10 @@ Inputs
     elem_len       float   Optional. Element length, default 1400 mm.
     max_angle      float   Optional. Max angle between consecutive runs, default 5 deg.
 
+    connect_last   bool    Optional, default True. Draw the final leftover part (shorter than
+                           min_elem) as one run of round(rest / elem_len) elements, if it
+                           keeps max_deviation and max_angle.
+
 Outputs
     polyline       Curve   Segmented polyline.
     points         Points  Run start/end points (polyline vertices).
@@ -24,6 +28,10 @@ try: elem_len
 except NameError: elem_len = None
 try: max_angle
 except NameError: max_angle = None
+
+try: connect_last
+except NameError: connect_last = None
+connect_last = True if connect_last is None else bool(connect_last)
 
 elem = elem_len if elem_len else 1400.0
 ang_max = max_angle if max_angle else 5.0
@@ -142,6 +150,24 @@ def run(crv, min_elem, max_dev):
         i_cur = j - 1
         stop = None
 
+    # ---- final short run (fewer than min_elem elements) ----
+    if counts and connect_last:
+        rem = total - S[min(i_cur + 1, N - 1)]
+        if elem * 0.5 < rem < min_run:
+            n_last = max(1, int(math.floor(rem / elem + 0.5)))
+            for n in range(min(n_last, n_min - 1), 0, -1):
+                st, end, j, dev, ang = attempt(start, i_cur, i_cur + 1, prev_dir, n)
+                if st == "ok":
+                    prev_dir = unit(start, end)
+                    out_pts.append(end)
+                    counts.append(n)
+                    devs.append(dev)
+                    angs.append(ang)
+                    start = end
+                    i_cur = j - 1
+                    stop = None
+                    break
+
     # ---- failure: nothing placed ----
     if not counts:
         st, dev, ang, pos = stop if stop else ("short", 0, 0, 0)
@@ -170,6 +196,7 @@ def run(crv, min_elem, max_dev):
     # ---- success (possibly partial) ----
     remaining = total - S[min(i_cur + 1, N - 1)]
     incomplete = remaining > elem * 0.5
+    failed = remaining >= min_run   # unsegmented part is at least one minimum run
     run_lengths = [c * elem for c in counts]
     if len(set(counts)) == 1:
         per_section = "%d each" % counts[0]
@@ -177,7 +204,7 @@ def run(crv, min_elem, max_dev):
         per_section = ", ".join(str(c) for c in counts)
 
     lines = [
-        "RESULT: %s" % ("INCOMPLETE" if incomplete else "OK"),
+        "RESULT: %s" % ("FAILED" if failed else "OK"),
         "- Straight sections: %d" % len(counts),
         "- Elements: %d total (%s)" % (sum(counts), per_section),
         "- Run length: %.0f - %.0f mm" % (min(run_lengths), max(run_lengths)),
