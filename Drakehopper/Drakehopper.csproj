@@ -4,7 +4,7 @@
     <TargetFramework>net48</TargetFramework>
     <LangVersion>latest</LangVersion>
     <TargetExt>.gha</TargetExt>
-    <AssemblyName>AutoInternalise</AssemblyName>
+    <AssemblyName>Drakehopper</AssemblyName>
     <RhinoDir>C:\Program Files\Rhino 8</RhinoDir>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>

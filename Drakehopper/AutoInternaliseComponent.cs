@@ -12,12 +12,12 @@ using Grasshopper.Kernel.Undo;
 using Grasshopper.Kernel.Undo.Actions;
 using Rhino;
 
-namespace AutoInternalise
+namespace Drakehopper
 {
-  public class AutoInternaliseInfo : GH_AssemblyInfo
+  public class DrakehopperInfo : GH_AssemblyInfo
   {
-    public override string Name => "AutoInternalise";
-    public override string Description => "Internalizes Rhino-referenced, Revit and wired parameters in the document.";
+    public override string Name => "Drakehopper";
+    public override string Description => "Custom Grasshopper components: Auto Internalise, Section Plane.";
     public override Guid Id => new Guid("3c8b85a1-4660-4ed7-b408-9ac3d5225454");
     public override string AuthorName => "";
     public override string AuthorContact => "";
@@ -72,7 +72,7 @@ namespace AutoInternalise
              "Rhino and Revit: while true, internalizes automatically, at most once every 15 minutes (shared), " +
              "and always when the file is saved. All: internalizes everything once when switched on. " +
              "Internalized nodes are outlined in orange.",
-             "Params", "Util")
+             "Drakehopper", "Util")
     { }
 
     public override Guid ComponentGuid => new Guid("916ac35d-0f66-4309-9cd8-25d402adccf3");
