@@ -1,5 +1,3 @@
-<p align="center"><img src="assets/icon-128.png" alt="Drakehopper-GH" width="128"></p>
-
 # Drakehopper-GH
 
 Custom Grasshopper components.
