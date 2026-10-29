@@ -11,13 +11,13 @@ namespace Drakehopper
   /// Starts at the curve start; each point lies exactly Dist[i] (straight-line) from the previous point.
   /// A distance of 0 returns the current point (a leading 0 gives the curve start).
   /// </summary>
-  public class DivideDistanceVariableComponent : GH_Component
+  public class DivideDistAlongCurveComponent : GH_Component
   {
     private const int Samples = 2000;   // scan samples per step
     private const int Bisections = 60;
 
-    public DivideDistanceVariableComponent()
-      : base("Divide Distance Variable", "DivDistVar",
+    public DivideDistAlongCurveComponent()
+      : base("DivideDistAlongCurve", "DivDist",
              "Like Divide Distance, but with a different chord (straight-line) distance per step. " +
              "Each point lies exactly Dist from the previous one. A distance of 0 returns the current point " +
              "(a leading 0 gives the curve start). Distances that cannot be reached are not placed.",
