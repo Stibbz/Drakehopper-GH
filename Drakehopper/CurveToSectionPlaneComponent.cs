@@ -13,9 +13,10 @@ namespace Drakehopper
   {
     public CurveToSectionPlaneComponent()
       : base("Section Plane", "SecPlane",
-             "Turns a section line/curve into a vertical plane at a curve parameter. " +
-             "The plane's X axis follows the curve's horizontal direction and its Y axis is world Z, " +
-             "so the plane stands upright on the section line and its normal points sideways to the line.",
+             "Creates a plane on a curve at a parameter. By default the plane stands upright and " +
+             "perpendicular to the curve, with its Y axis along world Z. " +
+             "Use Perpendicular to switch to parallel, Vertical to lay it flat, " +
+             "and World Z to follow the curve's slope instead of world Z.",
              "Drakehopper", "Util")
     { }
 
@@ -27,26 +28,33 @@ namespace Drakehopper
     {
       pManager.AddCurveParameter("Curve", "C", "Section line or curve.", GH_ParamAccess.item);
       pManager.AddNumberParameter("Parameter", "t",
-        "Position on the curve. Normalized (0 = start, 1 = end) by default.", GH_ParamAccess.item, 0.0);
-      pManager.AddBooleanParameter("Normalized", "N",
-        "True: t is 0-1 along the curve. False: t is the raw curve parameter.", GH_ParamAccess.item, true);
+        "Curve parameter (raw). Reparametrize the curve upstream if you need 0-1.", GH_ParamAccess.item, 0.0);
+      pManager.AddBooleanParameter("Perpendicular", "Pe",
+        "True: plane is perpendicular to the curve. False: plane is parallel to the curve.",
+        GH_ParamAccess.item, true);
+      pManager.AddBooleanParameter("Vertical", "Ve",
+        "True: plane stands upright (vertical). False: plane lies flat (horizontal).",
+        GH_ParamAccess.item, true);
+      pManager.AddBooleanParameter("World Z", "Z",
+        "True: use world Z as up, so upright planes stay vertical. False: follow the curve's slope, so a " +
+        "perpendicular plane is exactly 90 degrees to the curve.", GH_ParamAccess.item, true);
     }
 
     protected override void RegisterOutputParams(GH_OutputParamManager pManager)
     {
-      pManager.AddPlaneParameter("Plane", "Pl", "Vertical plane through the curve at the parameter.", GH_ParamAccess.item);
+      pManager.AddPlaneParameter("Plane", "Pl", "Plane through the curve at the parameter.", GH_ParamAccess.item);
     }
 
     protected override void SolveInstance(IGH_DataAccess DA)
     {
       Curve crv = null;
       double t = 0;
-      bool normalized = true;
+      bool zGlobal = true, perpendicular = true, vertical = true;
       if (!DA.GetData(0, ref crv) || crv == null) return;
       DA.GetData(1, ref t);
-      DA.GetData(2, ref normalized);
-
-      if (normalized) t = crv.Domain.ParameterAt(t);
+      DA.GetData(2, ref perpendicular);
+      DA.GetData(3, ref vertical);
+      DA.GetData(4, ref zGlobal);
 
       Point3d origin = crv.PointAt(t);
       Vector3d x = crv.TangentAt(t);
@@ -64,7 +72,34 @@ namespace Drakehopper
         }
       }
 
-      DA.SetData(0, new Plane(origin, x, Vector3d.ZAxis));
+      Vector3d up = Vector3d.ZAxis;
+
+      if (!zGlobal)
+      {
+        // Use the full 3D tangent; Y is world Z made perpendicular to it.
+        Vector3d tan = crv.TangentAt(t);
+        if (tan.Unitize())
+        {
+          Vector3d y = up - (up * tan) * tan;
+          if (y.Unitize())
+          {
+            up = y;
+            x = tan;
+          }
+        }
+      }
+
+      Vector3d side = Vector3d.CrossProduct(up, x);
+      side.Unitize();
+      // Horizontal: normal = up, X along curve (parallel) or across it (perpendicular).
+      // Vertical: normal along the curve (perpendicular) or sideways (parallel).
+      Plane plane;
+      if (!vertical)
+        plane = perpendicular ? new Plane(origin, side, -x) : new Plane(origin, x, side);
+      else
+        plane = perpendicular ? new Plane(origin, side, up) : new Plane(origin, x, up);
+
+      DA.SetData(0, plane);
     }
   }
 }
